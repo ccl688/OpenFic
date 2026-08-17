@@ -1,9 +1,10 @@
 name: Sync Upstream
 
-# 自动拉取上游仓库更新并合并到本 fork 的 main 分支
+# 自动拉取上游仓库更新合并到本 fork 的 main 分支，合并成功后自动重新打包 Docker 镜像
 # - 定时每 2 小时检查一次，也可手动触发（支持指定上游仓库/分支）
-# - 无更新 / fast-forward / 普通合并都自动完成
-# - 发生冲突时自动开 issue 提醒，绝不静默覆盖
+# - 合并策略：fast-forward 优先 → 普通 merge → 冲突时开 issue 提醒，绝不静默覆盖
+# - 有更新且合并推送成功后：构建 amd64/arm64 镜像推 ghcr.io/<owner>/openfic:main-*，
+#   再合并出多架构滚动标签 main（latest 保留给正式发版 tag）
 
 on:
   schedule:
@@ -22,14 +23,18 @@ on:
 permissions:
   contents: write
   issues: write
+  packages: write
 
 concurrency:
   group: sync-upstream
   cancel-in-progress: false
 
 jobs:
+  # ------------------------------------------------------------- 同步上游
   sync:
     runs-on: ubuntu-latest
+    outputs:
+      merged: ${{ steps.push.outputs.merged }}
     steps:
       - name: 检出 fork 默认分支
         uses: actions/checkout@v7
@@ -74,9 +79,11 @@ jobs:
           fi
 
       - name: 推送同步结果
+        id: push
         if: steps.behind.outputs.behind != '0' && env.SYNC_CONFLICT != '1'
         run: |
           git push origin HEAD:main
+          echo "merged=true" >> "$GITHUB_OUTPUT"
           echo "同步完成（方式：${SYNC_MODE}）"
 
       - name: 冲突时开 issue 提醒
@@ -87,3 +94,60 @@ jobs:
           gh issue create --repo "$GITHUB_REPOSITORY" \
             --title "⛔ 上游同步冲突（$(date -u +%Y-%m-%dT%H:%MZ)）" \
             --body $'自动同步上游失败：合并发生冲突，需要手动处理。\n\n本地解决步骤：\n\`\`\`bash\n# 先在本地把上游加为 remote（只需一次）\ngit remote add upstream https://github.com/syrizelink/OpenFic.git\n# 拉取并合并\ngit fetch upstream main\ngit checkout main\ngit merge upstream/main   # 手动解决冲突后 git add + git commit\ngit push origin main\n\`\`\`\n\n解决后可在仓库 Actions 页手动 Re-run 本工作流。'
+
+  # ------------------------------------------------- 合并成功后自动打包
+  docker:
+    name: Docker (${{ matrix.platform }})
+    needs: sync
+    if: needs.sync.outputs.merged == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+            suffix: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            suffix: linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    env:
+      BUILDX_NO_DEFAULT_ATTESTATIONS: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 构建并推送滚动镜像 main-<arch>
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          provenance: false
+          tags: ghcr.io/${{ github.repository_owner }}/openfic:main-${{ matrix.suffix }}
+          cache-from: type=gha,scope=sync-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=sync-${{ matrix.suffix }}
+
+  docker-manifest:
+    needs: [sync, docker]
+    if: needs.sync.outputs.merged == 'true' && needs.docker.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 合并多架构滚动标签 main
+        run: |
+          IMAGE=ghcr.io/${{ github.repository_owner }}/openfic
+          IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          docker buildx imagetools create \
+            -t "${IMAGE}:main" \
+            "${IMAGE}:main-linux-x86_64" \
+            "${IMAGE}:main-linux-aarch64"
