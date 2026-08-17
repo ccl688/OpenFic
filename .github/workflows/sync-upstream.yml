@@ -1,0 +1,89 @@
+name: Sync Upstream
+
+# 自动拉取上游仓库更新并合并到本 fork 的 main 分支
+# - 定时每 2 小时检查一次，也可手动触发（支持指定上游仓库/分支）
+# - 无更新 / fast-forward / 普通合并都自动完成
+# - 发生冲突时自动开 issue 提醒，绝不静默覆盖
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: 上游仓库（owner/repo）
+        required: false
+        default: syrizelink/OpenFic
+      upstream_branch:
+        description: 上游分支
+        required: false
+        default: main
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出 fork 默认分支
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 拉取上游
+        env:
+          UPSTREAM_REPO: ${{ inputs.upstream_repo || 'syrizelink/OpenFic' }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'main' }}
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "$UPSTREAM_BRANCH"
+
+      - name: 判断是否有更新
+        id: behind
+        env:
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'main' }}
+        run: |
+          BEHIND=$(git rev-list --count "HEAD..upstream/${UPSTREAM_BRANCH}")
+          echo "behind=${BEHIND}" >> "$GITHUB_OUTPUT"
+          echo "上游领先 ${BEHIND} 个提交"
+
+      - name: 无更新则退出
+        if: steps.behind.outputs.behind == '0'
+        run: echo "已是最新，无需同步"
+
+      - name: 合并上游（fast-forward 优先，冲突则失败）
+        if: steps.behind.outputs.behind != '0'
+        env:
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'main' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git merge --ff-only "upstream/${UPSTREAM_BRANCH}"; then
+            echo "SYNC_MODE=fast-forward" >> "$GITHUB_ENV"
+          elif git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+            echo "SYNC_MODE=merge-commit" >> "$GITHUB_ENV"
+          else
+            echo "SYNC_CONFLICT=1" >> "$GITHUB_ENV"
+            exit 1
+          fi
+
+      - name: 推送同步结果
+        if: steps.behind.outputs.behind != '0' && env.SYNC_CONFLICT != '1'
+        run: |
+          git push origin HEAD:main
+          echo "同步完成（方式：${SYNC_MODE}）"
+
+      - name: 冲突时开 issue 提醒
+        if: env.SYNC_CONFLICT == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "⛔ 上游同步冲突（$(date -u +%Y-%m-%dT%H:%MZ)）" \
+            --body $'自动同步上游失败：合并发生冲突，需要手动处理。\n\n本地解决步骤：\n\`\`\`bash\n# 先在本地把上游加为 remote（只需一次）\ngit remote add upstream https://github.com/syrizelink/OpenFic.git\n# 拉取并合并\ngit fetch upstream main\ngit checkout main\ngit merge upstream/main   # 手动解决冲突后 git add + git commit\ngit push origin main\n\`\`\`\n\n解决后可在仓库 Actions 页手动 Re-run 本工作流。'
