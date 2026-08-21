@@ -8,6 +8,7 @@
 
 from collections.abc import AsyncGenerator
 from pathlib import Path
+import sqlite3
 import shutil
 
 import httpx
@@ -29,6 +30,7 @@ from app.api.routers import (
     chapter_context,
     chapter_exports,
     chapters,
+    commands,
     dashboard,
     health,
     import_router,
@@ -59,6 +61,19 @@ TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 _per_test_session: AsyncSession | None = None
 
 
+@pytest.fixture
+def fast_checkpoint_sqlite(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Avoid host-dependent fsync latency in checkpoint behavior tests."""
+    original_connect = sqlite3.connect
+
+    def connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        connection.execute("PRAGMA synchronous = OFF")
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+
+
 class _NotFoundIconHttpClient:
     """Avoid network-client setup for tests that do not exercise icon fetching."""
 
@@ -80,6 +95,7 @@ def _create_test_app() -> FastAPI:
     test_app.include_router(volumes.router, prefix="/api/v1")
     test_app.include_router(chapters.router, prefix="/api/v1")
     test_app.include_router(notes.router, prefix="/api/v1")
+    test_app.include_router(commands.router, prefix="/api/v1")
     test_app.include_router(characters.router, prefix="/api/v1")
     test_app.include_router(world_info.router, prefix="/api/v1")
     test_app.include_router(world_info_entries.router, prefix="/api/v1")
@@ -174,7 +190,9 @@ async def client(_test_app: FastAPI, db_engine) -> AsyncGenerator[AsyncClient, N
 
 
 @pytest_asyncio.fixture
-async def isolated_prompts_dir(monkeypatch, tmp_path: Path) -> AsyncGenerator[Path, None]:
+async def isolated_prompts_dir(
+    monkeypatch, tmp_path: Path
+) -> AsyncGenerator[Path, None]:
     """每个测试使用隔离的 prompts 目录，避免污染仓库内 YAML。"""
     import app.prompts.loader as prompt_loader
 
