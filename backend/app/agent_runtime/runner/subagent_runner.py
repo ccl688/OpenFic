@@ -50,6 +50,11 @@ from app.agent_runtime.types import (
     ReactAgentConfig,
     TerminationCondition,
 )
+from app.agent_runtime.usage_cost import (
+    calculate_llm_call_cost,
+    extract_cache_read_tokens,
+    extract_cache_write_tokens,
+)
 from app.core.encryption import EncryptionService
 from app.models.clients.model_factory import ModelConfig, create_chat_model
 from app.models.repos import model_provider_repo, model_repo
@@ -174,6 +179,10 @@ async def _build_model_config_from_record(session: Any, record_id: str) -> dict[
         "api_key": api_key,
         "model_id": model.model_id,
         "max_context_tokens": model.context_length,
+        "input_price": getattr(model, "input_price", 0.0),
+        "output_price": getattr(model, "output_price", 0.0),
+        "cache_read_price": getattr(model, "cache_read_price", 0.0),
+        "cache_write_price": getattr(model, "cache_write_price", 0.0),
         "temperature": model.temperature,
         "top_p": model.top_p,
         "top_k": model.top_k,
@@ -398,16 +407,18 @@ class SubagentRunner:
         finally:
             await _close_session(session)
         model = create_chat_model(ModelConfig(**to_client_model_config(model_config)))
-        return create_react_agent(
+        graph = create_react_agent(
             agent_config,
             model=model,
             checkpointer=await get_checkpointer(),
         )
+        return graph, model_config
 
     async def _invoke_graph(
         self,
         row: AgentChildRun,
         graph: Any,
+        model_config: dict[str, Any],
         graph_input: Any,
         runtime_state: dict[str, Any],
         audit_context: AuditContext,
@@ -433,7 +444,11 @@ class SubagentRunner:
             await agent_event_sink("agent:retry", payload)
 
         async def compaction_usage_sink(payload: dict[str, Any]) -> None:
-            normalized = self._normalize_usage_event(row.child_thread_id, payload)
+            normalized = self._normalize_usage_event(
+                row.child_thread_id,
+                payload,
+                model_config=model_config,
+            )
             normalized["parent_session_id"] = row.parent_session_id
             await self._persist_parent_task_usage_and_emit_delta(row, normalized)
 
@@ -466,6 +481,7 @@ class SubagentRunner:
                             payload = self._normalize_usage_event(
                                 row.child_thread_id,
                                 payload,
+                                model_config=model_config,
                             )
                             await self._persist_parent_task_usage_and_emit_delta(
                                 row,
@@ -640,11 +656,16 @@ class SubagentRunner:
             },
         )
 
-    def _normalize_usage_event(self, session_id: str, event_data: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_usage_event(
+        self,
+        session_id: str,
+        event_data: dict[str, Any],
+        *,
+        model_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        active_model_config = model_config if model_config is not None else self.model_config
         usage = event_data.get("usage") if isinstance(event_data, dict) else None
         usage_dict = usage if isinstance(usage, dict) else {}
-        input_details = usage_dict.get("input_token_details")
-        input_details_dict = input_details if isinstance(input_details, dict) else {}
         token_input = int(
             usage_dict.get("input_tokens")
             or usage_dict.get("prompt_tokens")
@@ -657,20 +678,30 @@ class SubagentRunner:
             or usage_dict.get("token_output")
             or 0
         )
-        token_cache = int(
-            usage_dict.get("cache_read_tokens")
-            or input_details_dict.get("cache_read")
-            or input_details_dict.get("cached_tokens")
-            or usage_dict.get("token_cache")
-            or 0
+        token_cache = extract_cache_read_tokens(usage_dict)
+        if token_cache == 0:
+            token_cache = max(int(usage_dict.get("token_cache") or 0), 0)
+        token_cache_write = extract_cache_write_tokens(usage_dict)
+        if token_cache_write == 0:
+            token_cache_write = max(int(usage_dict.get("token_cache_write") or 0), 0)
+        call_cost = calculate_llm_call_cost(
+            token_input=token_input,
+            token_output=token_output,
+            token_cache=token_cache,
+            token_cache_write=token_cache_write,
+            input_price=float(active_model_config.get("input_price") or 0),
+            output_price=float(active_model_config.get("output_price") or 0),
+            cache_read_price=float(active_model_config.get("cache_read_price") or 0),
+            cache_write_price=float(active_model_config.get("cache_write_price") or 0),
         )
         return {
             "session_id": session_id,
             "token_input": token_input,
             "token_output": token_output,
             "token_cache": token_cache,
+            "cost": call_cost,
             "context_input_tokens": token_input,
-            "context_length": int(self.model_config.get("max_context_tokens", 0)),
+            "context_length": int(active_model_config.get("max_context_tokens", 0)),
             **(
                 {"usage_kind": event_data["usage_kind"]}
                 if isinstance(event_data.get("usage_kind"), str)
@@ -687,6 +718,7 @@ class SubagentRunner:
         token_input = int(payload.get("token_input", 0))
         token_output = int(payload.get("token_output", 0))
         token_cache = int(payload.get("token_cache", 0))
+        cost = float(payload.get("cost", 0.0) or 0.0)
         context_input_tokens = int(payload.get("context_input_tokens", 0))
         context_length = int(payload.get("context_length", 0))
         delta_payload = {
@@ -695,11 +727,13 @@ class SubagentRunner:
             "token_input": token_input,
             "token_output": token_output,
             "token_cache": token_cache,
+            "cost": cost,
         }
         usage_snapshot = {
             "token_input": token_input,
             "token_output": token_output,
             "token_cache": token_cache,
+            "cost": cost,
             "context_input_tokens": context_input_tokens,
             "context_length": context_length,
         }
@@ -714,6 +748,7 @@ class SubagentRunner:
                     token_input=token_input,
                     token_output=token_output,
                     token_cache=token_cache,
+                    cost=cost,
                 )
                 child_row = await session.get(AgentChildRun, row.id)
                 if child_row is None:
@@ -955,7 +990,7 @@ class SubagentRunner:
             request_row.content,
             parent_revision_id=request_row.parent_revision_id,
         )
-        graph = await self._build_graph(row, definition, runtime_state)
+        graph, model_config = await self._build_graph(row, definition, runtime_state)
         graph_input: Any
         if resume_payload is None:
             graph_input = {
@@ -978,6 +1013,7 @@ class SubagentRunner:
             result_state = await self._invoke_graph(
                 row,
                 graph,
+                model_config,
                 graph_input,
                 runtime_state,
                 audit_context,
